@@ -1,0 +1,1659 @@
+"""API for Messaging, Analytics, and Portal apps."""
+
+from rest_framework import serializers, viewsets, status
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated, AllowAny
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
+
+from apps.messaging.models import Message, EmailTemplate
+from apps.analytics.models import AnalyticsDaily
+from apps.accounts.permissions import IsRecruiter, HasTenantAccess, IsTenantAdmin
+
+
+# ===========================================================================
+# MESSAGING API
+# ===========================================================================
+
+class MessageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Message
+        fields = [
+            "id", "candidate", "application", "sender", "channel",
+            "direction", "subject", "body", "status", "sent_at", "created_at",
+        ]
+        read_only_fields = ["id", "status", "sent_at", "created_at"]
+
+
+class EmailTemplateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = EmailTemplate
+        fields = ["id", "slug", "name", "subject", "body", "category", "is_active", "created_at"]
+        read_only_fields = ["id", "created_at"]
+
+
+class MessageViewSet(viewsets.ModelViewSet):
+    serializer_class = MessageSerializer
+    permission_classes = [IsAuthenticated, HasTenantAccess, IsRecruiter]
+    filterset_fields = ["candidate", "status", "channel"]
+
+    def get_queryset(self):
+        return Message.objects.filter(tenant_id=self.request.tenant_id)
+
+    def perform_create(self, serializer):
+        message = serializer.save(
+            tenant_id=self.request.tenant_id,
+            sender=self.request.user,
+            status="queued",
+        )
+        # Queue for async delivery
+        try:
+            from apps.messaging.tasks import send_email_task
+            send_email_task.delay(str(message.id))
+        except Exception:
+            pass
+
+
+class EmailTemplateViewSet(viewsets.ModelViewSet):
+    serializer_class = EmailTemplateSerializer
+    permission_classes = [IsAuthenticated, HasTenantAccess, IsTenantAdmin]
+
+    def get_queryset(self):
+        return EmailTemplate.objects.filter(tenant_id=self.request.tenant_id)
+
+    def perform_create(self, serializer):
+        serializer.save(tenant_id=self.request.tenant_id)
+
+
+messaging_router = DefaultRouter()
+messaging_router.register("messages", MessageViewSet, basename="messages")
+messaging_router.register("templates", EmailTemplateViewSet, basename="email-templates")
+
+messaging_urlpatterns = [path("", include(messaging_router.urls))]
+
+
+# ===========================================================================
+# ANALYTICS API
+# ===========================================================================
+
+class AnalyticsDailySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AnalyticsDaily
+        fields = ["id", "job", "metric", "value", "metadata", "computed_date"]
+
+
+class AnalyticsView(APIView):
+    permission_classes = [IsAuthenticated, HasTenantAccess, IsRecruiter]
+
+    def get(self, request):
+        """Get analytics metrics for the tenant."""
+        job_id = request.query_params.get("job_id")
+        metric = request.query_params.get("metric")
+        start_date = request.query_params.get("start_date")
+        end_date = request.query_params.get("end_date")
+
+        qs = AnalyticsDaily.objects.filter(tenant_id=request.tenant_id)
+        if job_id:
+            qs = qs.filter(job_id=job_id)
+        if metric:
+            qs = qs.filter(metric=metric)
+        if start_date:
+            qs = qs.filter(computed_date__gte=start_date)
+        if end_date:
+            qs = qs.filter(computed_date__lte=end_date)
+
+        return Response(AnalyticsDailySerializer(qs[:500], many=True).data)
+
+
+class FunnelView(APIView):
+    """Compute real-time funnel conversion for a job."""
+    permission_classes = [IsAuthenticated, HasTenantAccess, IsRecruiter]
+
+    def get(self, request):
+        job_id = request.query_params.get("job_id")
+        if not job_id:
+            return Response({"error": "job_id required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        from apps.jobs.models import PipelineStage
+        from apps.applications.models import Application
+
+        stages = PipelineStage.objects.filter(
+            job_id=job_id, tenant_id=request.tenant_id
+        ).order_by("order")
+
+        funnel = []
+        for stage in stages:
+            count = Application.objects.filter(
+                job_id=job_id,
+                tenant_id=request.tenant_id,
+                stage_history__to_stage=stage,
+            ).distinct().count()
+            funnel.append({
+                "stage": stage.name,
+                "stage_type": stage.stage_type,
+                "count": count,
+            })
+
+        return Response({"job_id": job_id, "funnel": funnel})
+
+
+
+
+
+# ===========================================================================
+# ANALYTICS — KPI Dashboard (Features 89-96)
+# ===========================================================================
+
+class KPIDashboardView(APIView):
+    """Real-time KPI dashboard for hiring metrics."""
+    permission_classes = [IsAuthenticated, HasTenantAccess, IsRecruiter]
+
+    def get(self, request):
+        from apps.applications.models import Application, Interview, Offer, Employee
+        from apps.candidates.models import Candidate
+        from apps.jobs.models import Job
+        from django.db.models import Avg, Count, Q
+        from django.utils import timezone
+        import datetime
+
+        tid = request.tenant_id
+        now = timezone.now()
+        thirty_days_ago = now - datetime.timedelta(days=30)
+        period = request.query_params.get("period", "30")
+        period_start = now - datetime.timedelta(days=int(period))
+
+        # Core KPIs
+        total_apps = Application.objects.filter(tenant_id=tid, created_at__gte=period_start).count()
+        active_apps = Application.objects.filter(tenant_id=tid, status="active").count()
+        hired = Application.objects.filter(tenant_id=tid, status="hired", created_at__gte=period_start).count()
+        rejected = Application.objects.filter(tenant_id=tid, status="rejected", created_at__gte=period_start).count()
+        open_jobs = Job.objects.filter(tenant_id=tid, status="open").count()
+        total_candidates = Candidate.objects.filter(tenant_id=tid, status="active").count()
+
+        # Time to hire (avg days from application to hire)
+        hired_apps = Application.objects.filter(tenant_id=tid, status="hired", created_at__gte=period_start)
+        avg_time_to_hire = None
+        if hired_apps.exists():
+            durations = [(a.updated_at - a.created_at).days for a in hired_apps[:100]]
+            avg_time_to_hire = sum(durations) / max(len(durations), 1)
+
+        # Offer acceptance rate
+        total_offers = Offer.objects.filter(tenant_id=tid, created_at__gte=period_start).count()
+        accepted_offers = Offer.objects.filter(tenant_id=tid, status="accepted", created_at__gte=period_start).count()
+        offer_acceptance_rate = round(accepted_offers / max(total_offers, 1) * 100, 1)
+
+        # Interview completion rate
+        total_interviews = Interview.objects.filter(tenant_id=tid, created_at__gte=period_start).count()
+        completed_interviews = Interview.objects.filter(tenant_id=tid, status="completed", created_at__gte=period_start).count()
+
+        # Avg score
+        avg_score = Application.objects.filter(tenant_id=tid, score__isnull=False).aggregate(avg=Avg("score"))["avg"]
+
+        return Response({
+            "period_days": int(period),
+            "kpis": {
+                "total_applications": total_apps,
+                "active_applications": active_apps,
+                "hired": hired,
+                "rejected": rejected,
+                "open_jobs": open_jobs,
+                "total_candidates": total_candidates,
+                "avg_time_to_hire_days": round(avg_time_to_hire, 1) if avg_time_to_hire else None,
+                "offer_acceptance_rate": offer_acceptance_rate,
+                "interview_completion_rate": round(completed_interviews / max(total_interviews, 1) * 100, 1),
+                "avg_candidate_score": round(avg_score, 2) if avg_score else None,
+                "total_offers": total_offers,
+                "accepted_offers": accepted_offers,
+            },
+        })
+
+
+class RecruiterPerformanceView(APIView):
+    """Per-recruiter hiring metrics."""
+    permission_classes = [IsAuthenticated, HasTenantAccess, IsRecruiter]
+
+    def get(self, request):
+        from apps.applications.models import Application
+        from apps.accounts.models import User
+        from django.db.models import Count, Avg, Q
+        from django.utils import timezone
+        import datetime
+
+        tid = request.tenant_id
+        period = int(request.query_params.get("period", "30"))
+        since = timezone.now() - datetime.timedelta(days=period)
+
+        # Get recruiters with application stats
+        recruiters = User.objects.filter(
+            tenant_id=tid, user_type__in=["recruiter", "admin"], is_active=True
+        )
+
+        results = []
+        for recruiter in recruiters:
+            apps = Application.objects.filter(
+                tenant_id=tid,
+                assigned_recruiter=recruiter,
+                created_at__gte=since,
+            )
+            results.append({
+                "recruiter_id": str(recruiter.id),
+                "name": f"{recruiter.first_name} {recruiter.last_name}",
+                "total_applications": apps.count(),
+                "hired": apps.filter(status="hired").count(),
+                "rejected": apps.filter(status="rejected").count(),
+                "active": apps.filter(status="active").count(),
+                "avg_score": apps.aggregate(avg=Avg("score"))["avg"],
+            })
+
+        results.sort(key=lambda x: x["hired"], reverse=True)
+        return Response({"period_days": period, "recruiters": results})
+
+
+class PipelineVelocityView(APIView):
+    """Time-in-stage analysis for pipeline velocity."""
+    permission_classes = [IsAuthenticated, HasTenantAccess, IsRecruiter]
+
+    def get(self, request):
+        from apps.applications.models import StageHistory
+        from django.db.models import Avg, F
+        from django.utils import timezone
+        import datetime
+
+        tid = request.tenant_id
+        job_id = request.query_params.get("job_id")
+
+        qs = StageHistory.objects.filter(tenant_id=tid)
+        if job_id:
+            qs = qs.filter(application__job_id=job_id)
+
+        # Calculate time per stage
+        stages = {}
+        for sh in qs.select_related("from_stage", "to_stage")[:1000]:
+            stage_name = sh.to_stage.name if sh.to_stage else "Unknown"
+            if stage_name not in stages:
+                stages[stage_name] = {"count": 0, "total_days": 0}
+            stages[stage_name]["count"] += 1
+
+        return Response({
+            "velocity": [
+                {
+                    "stage": name,
+                    "transitions": data["count"],
+                }
+                for name, data in stages.items()
+            ],
+        })
+
+
+class DiversityMetricsView(APIView):
+    """Diversity and inclusion metrics (anonymized)."""
+    permission_classes = [IsAuthenticated, HasTenantAccess, IsRecruiter]
+
+    def get(self, request):
+        from apps.applications.models import Application
+        from django.db.models import Count
+
+        tid = request.tenant_id
+
+        # Source distribution
+        source_dist = Application.objects.filter(
+            tenant_id=tid
+        ).values("source").annotate(count=Count("id")).order_by("-count")
+
+        # Stage distribution by source
+        stage_dist = Application.objects.filter(
+            tenant_id=tid, status="active"
+        ).values(
+            "current_stage__name", "source"
+        ).annotate(count=Count("id"))
+
+        return Response({
+            "source_distribution": list(source_dist),
+            "stage_by_source": list(stage_dist),
+            "note": "Demographics tracking requires opt-in EEO configuration",
+        })
+
+
+class SourceROIView(APIView):
+    """ROI analysis by application source."""
+    permission_classes = [IsAuthenticated, HasTenantAccess, IsRecruiter]
+
+    def get(self, request):
+        from apps.applications.models import Application
+        from django.db.models import Count, Avg, Q
+
+        tid = request.tenant_id
+
+        sources = Application.objects.filter(
+            tenant_id=tid
+        ).values("source").annotate(
+            total=Count("id"),
+            hired=Count("id", filter=Q(status="hired")),
+            rejected=Count("id", filter=Q(status="rejected")),
+            avg_score=Avg("score"),
+        ).order_by("-hired")
+
+        results = []
+        for src in sources:
+            conversion = round(src["hired"] / max(src["total"], 1) * 100, 1)
+            results.append({
+                "source": src["source"] or "unknown",
+                "total_applications": src["total"],
+                "hired": src["hired"],
+                "rejected": src["rejected"],
+                "conversion_rate": conversion,
+                "avg_score": round(src["avg_score"], 2) if src["avg_score"] else None,
+            })
+
+        return Response({"sources": results})
+
+
+class SLAComplianceView(APIView):
+    """SLA compliance: applications exceeding stage time limits."""
+    permission_classes = [IsAuthenticated, HasTenantAccess, IsRecruiter]
+
+    def get(self, request):
+        from apps.applications.models import Application
+        from apps.jobs.models import PipelineStage
+        from django.utils import timezone
+        import datetime
+
+        tid = request.tenant_id
+
+        # Find stages with SLA
+        stages_with_sla = PipelineStage.objects.filter(
+            tenant_id=tid, sla_days__isnull=False, sla_days__gt=0
+        )
+
+        violations = []
+        for stage in stages_with_sla:
+            deadline = timezone.now() - datetime.timedelta(days=stage.sla_days)
+            overdue = Application.objects.filter(
+                tenant_id=tid,
+                current_stage=stage,
+                status="active",
+                updated_at__lt=deadline,
+            ).count()
+
+            total_in_stage = Application.objects.filter(
+                tenant_id=tid, current_stage=stage, status="active"
+            ).count()
+
+            violations.append({
+                "stage": stage.name,
+                "job": stage.job.title if stage.job else "",
+                "sla_days": stage.sla_days,
+                "overdue_count": overdue,
+                "total_in_stage": total_in_stage,
+                "compliance_rate": round((1 - overdue / max(total_in_stage, 1)) * 100, 1),
+            })
+
+        return Response({"sla_violations": violations})
+
+
+class HiringForecastView(APIView):
+    """Hiring forecast based on pipeline data and historical trends."""
+    permission_classes = [IsAuthenticated, HasTenantAccess, IsRecruiter]
+
+    def get(self, request):
+        from apps.applications.models import Application
+        from apps.jobs.models import Job
+        from django.db.models import Count, Q
+        from django.utils import timezone
+        import datetime
+
+        tid = request.tenant_id
+
+        open_jobs = Job.objects.filter(tenant_id=tid, status="open")
+        forecasts = []
+        for job in open_jobs[:20]:
+            pipeline = Application.objects.filter(job=job, tenant_id=tid, status="active")
+            total = pipeline.count()
+            # Historical conversion rate for this job
+            all_apps = Application.objects.filter(job=job, tenant_id=tid)
+            hired_for_job = all_apps.filter(status="hired").count()
+            conversion = hired_for_job / max(all_apps.count(), 1)
+
+            forecasts.append({
+                "job_id": str(job.id),
+                "job_title": job.title,
+                "active_pipeline": total,
+                "headcount_target": job.headcount_target,
+                "headcount_filled": job.headcount_filled,
+                "headcount_remaining": (job.headcount_target or 1) - (job.headcount_filled or 0),
+                "estimated_hires": round(total * max(conversion, 0.05)),
+                "historical_conversion": round(conversion * 100, 1),
+            })
+
+        return Response({"forecasts": forecasts})
+
+
+class AnalyticsExportView(APIView):
+    """Export analytics data as CSV."""
+    permission_classes = [IsAuthenticated, HasTenantAccess, IsRecruiter]
+
+    def get(self, request):
+        import csv
+        import io
+        from django.http import HttpResponse
+        from apps.applications.models import Application
+
+        tid = request.tenant_id
+        export_type = request.query_params.get("type", "applications")
+
+        if export_type == "applications":
+            apps = Application.objects.filter(
+                tenant_id=tid
+            ).select_related("candidate", "job", "current_stage")[:5000]
+
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow([
+                "Application ID", "Candidate", "Email", "Job", "Stage",
+                "Status", "Score", "Source", "Priority", "On Hold",
+                "Applied At", "Updated At",
+            ])
+
+            for app in apps:
+                writer.writerow([
+                    str(app.id),
+                    app.candidate.full_name if app.candidate else "",
+                    app.candidate.primary_email if app.candidate else "",
+                    app.job.title if app.job else "",
+                    app.current_stage.name if app.current_stage else "",
+                    app.status,
+                    app.score,
+                    app.source,
+                    app.is_priority,
+                    app.on_hold,
+                    app.created_at.isoformat(),
+                    app.updated_at.isoformat(),
+                ])
+
+            response = HttpResponse(output.getvalue(), content_type="text/csv")
+            response["Content-Disposition"] = f"attachment; filename=applications_export.csv"
+            return response
+
+        return Response({"error": "Unknown export type"}, status=status.HTTP_400_BAD_REQUEST)
+
+
+# SavedReport API
+class SavedReportSerializer(serializers.ModelSerializer):
+    class Meta:
+        from apps.analytics.models import SavedReport
+        model = SavedReport
+        fields = ["id", "name", "report_type", "query_config", "schedule",
+                  "recipients", "last_run_at", "created_at", "updated_at"]
+        read_only_fields = ["id", "last_run_at", "created_at", "updated_at"]
+
+
+class SavedReportListView(APIView):
+    permission_classes = [IsAuthenticated, HasTenantAccess, IsRecruiter]
+
+    def get(self, request):
+        from apps.analytics.models import SavedReport
+        reports = SavedReport.objects.filter(tenant_id=request.tenant_id)
+        return Response(SavedReportSerializer(reports, many=True).data)
+
+    def post(self, request):
+        from apps.analytics.models import SavedReport
+        ser = SavedReportSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        ser.save(tenant_id=request.tenant_id)
+        return Response(ser.data, status=status.HTTP_201_CREATED)
+
+
+class SavedReportDetailView(APIView):
+    permission_classes = [IsAuthenticated, HasTenantAccess, IsRecruiter]
+
+    def get(self, request, pk):
+        from apps.analytics.models import SavedReport
+        report = SavedReport.objects.get(id=pk, tenant_id=request.tenant_id)
+        return Response(SavedReportSerializer(report).data)
+
+    def delete(self, request, pk):
+        from apps.analytics.models import SavedReport
+        SavedReport.objects.filter(id=pk, tenant_id=request.tenant_id).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+
+
+# ===========================================================================
+# PORTAL API (Public / Anonymous) — Enhanced
+# ===========================================================================
+
+class PortalApplySerializer(serializers.Serializer):
+    full_name = serializers.CharField(max_length=300)
+    email = serializers.EmailField()
+    phone = serializers.CharField(max_length=30, required=False, default="")
+    job_id = serializers.UUIDField()
+    consent_data_processing = serializers.BooleanField(default=False)
+
+
+class PortalApplyView(APIView):
+    """Public endpoint: anonymous candidate application."""
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        ser = PortalApplySerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+
+        # Get the job and its tenant
+        from apps.jobs.models import Job
+        try:
+            job = Job.objects.get(id=data["job_id"], status="open")
+        except Job.DoesNotExist:
+            return Response({"error": "Job not found or closed"}, status=status.HTTP_404_NOT_FOUND)
+
+        tenant_id = str(job.tenant_id)
+
+        # Resolve/create candidate
+        from apps.candidates.services import resolve_candidate
+        from apps.candidates.models import Candidate, CandidateIdentity
+
+        result = resolve_candidate(
+            tenant_id=tenant_id,
+            full_name=data["full_name"],
+            email=data["email"],
+            phone=data.get("phone"),
+        )
+
+        if result["action"] in ("existing", "auto_linked"):
+            candidate_id = result["candidate_id"]
+        else:
+            candidate = Candidate.objects.create(
+                tenant_id=tenant_id,
+                full_name=data["full_name"],
+                primary_email=data["email"],
+                primary_phone=data.get("phone", ""),
+                source="portal",
+            )
+            candidate_id = candidate.id
+
+            # Create identity records
+            CandidateIdentity.objects.create(
+                tenant_id=tenant_id,
+                candidate=candidate,
+                identity_type="email",
+                identity_value=data["email"].lower().strip(),
+            )
+
+        # Create application
+        from apps.applications.models import Application, StageHistory
+        from apps.jobs.models import PipelineStage
+
+        # Check if already applied
+        if Application.objects.filter(
+            job_id=data["job_id"],
+            candidate_id=candidate_id,
+            tenant_id=tenant_id,
+        ).exists():
+            return Response({"error": "Already applied"}, status=status.HTTP_409_CONFLICT)
+
+        first_stage = PipelineStage.objects.filter(
+            job=job, tenant_id=tenant_id,
+        ).order_by("order").first()
+
+        app = Application.objects.create(
+            tenant_id=tenant_id,
+            job=job,
+            candidate_id=candidate_id,
+            current_stage=first_stage,
+            source="portal",
+        )
+
+        StageHistory.objects.create(
+            tenant_id=tenant_id,
+            application=app,
+            to_stage=first_stage,
+            notes="Applied via portal",
+        )
+
+        # Record consent
+        if data.get("consent_data_processing"):
+            from apps.consent.models import ConsentRecord
+            from django.utils import timezone
+            ConsentRecord.objects.create(
+                tenant_id=tenant_id,
+                candidate_id=candidate_id,
+                consent_type="data_processing",
+                granted=True,
+                granted_at=timezone.now(),
+                ip_address=request.META.get("REMOTE_ADDR"),
+            )
+
+        # Generate status tracking token
+        import jwt
+        from django.conf import settings
+        from datetime import datetime, timedelta
+
+        token_payload = {
+            "application_id": str(app.id),
+            "candidate_id": str(candidate_id),
+            "tenant_id": tenant_id,
+            "exp": datetime.utcnow() + timedelta(days=90),
+        }
+        tracking_token = jwt.encode(token_payload, settings.SECRET_KEY, algorithm="HS256")
+
+        return Response({
+            "application_id": str(app.id),
+            "tracking_token": tracking_token,
+            "status": "applied",
+            "message": "Application submitted successfully",
+        }, status=status.HTTP_201_CREATED)
+
+
+class PortalStatusView(APIView):
+    """Public endpoint: check application status via signed token."""
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        token = request.query_params.get("token")
+        if not token:
+            return Response({"error": "token required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        import jwt
+        from django.conf import settings
+
+        try:
+            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+        except jwt.ExpiredSignatureError:
+            return Response({"error": "Token expired"}, status=status.HTTP_401_UNAUTHORIZED)
+        except jwt.InvalidTokenError:
+            return Response({"error": "Invalid token"}, status=status.HTTP_401_UNAUTHORIZED)
+
+        from apps.applications.models import Application
+
+        try:
+            app = Application.objects.select_related("current_stage", "job").get(
+                id=payload["application_id"],
+                tenant_id=payload["tenant_id"],
+            )
+        except Application.DoesNotExist:
+            return Response({"error": "Application not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response({
+            "application_id": str(app.id),
+            "job_title": app.job.title,
+            "current_stage": app.current_stage.name if app.current_stage else None,
+            "status": app.status,
+            "applied_at": app.created_at.isoformat(),
+        })
+
+
+class PortalJobAlertView(APIView):
+    """Public: subscribe to job alerts."""
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        from apps.portal.models import JobAlert
+        from apps.tenants.models import Tenant
+
+        tenant_slug = request.data.get("tenant_slug", "")
+        try:
+            tenant = Tenant.objects.get(slug=tenant_slug)
+        except Tenant.DoesNotExist:
+            return Response({"error": "Company not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        alert, created = JobAlert.objects.get_or_create(
+            tenant=tenant,
+            email=request.data.get("email", ""),
+            defaults={
+                "name": request.data.get("name", ""),
+                "keywords": request.data.get("keywords", []),
+                "department": request.data.get("department", ""),
+                "location": request.data.get("location", ""),
+            },
+        )
+
+        return Response({
+            "id": str(alert.id),
+            "email": alert.email,
+            "created": created,
+        }, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+
+
+class PortalFeedbackView(APIView):
+    """Public: post-rejection feedback from candidate."""
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        from apps.portal.models import PortalToken, CandidateFeedback
+
+        token = request.data.get("token")
+        if not token:
+            return Response({"error": "token required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            portal_token = PortalToken.objects.get(
+                token=token, purpose="feedback"
+            )
+        except PortalToken.DoesNotExist:
+            return Response({"error": "Invalid or expired token"}, status=status.HTTP_401_UNAUTHORIZED)
+
+        from django.utils import timezone
+        if portal_token.expires_at < timezone.now():
+            return Response({"error": "Token expired"}, status=status.HTTP_401_UNAUTHORIZED)
+
+        feedback = CandidateFeedback.objects.create(
+            tenant=portal_token.tenant,
+            candidate=portal_token.candidate,
+            application=portal_token.application,
+            overall_rating=request.data.get("rating", 3),
+            comments=request.data.get("comments", ""),
+            would_apply_again=request.data.get("would_apply_again"),
+        )
+
+        portal_token.used_at = timezone.now()
+        portal_token.save(update_fields=["used_at"])
+
+        return Response({"id": str(feedback.id), "message": "Thank you for your feedback"}, status=status.HTTP_201_CREATED)
+
+
+class PortalCareerPageView(APIView):
+    """Public: career page configuration and job listings."""
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        from apps.tenants.models import Tenant, TenantSettings
+        from apps.jobs.models import Job
+
+        tenant_slug = request.query_params.get("tenant")
+        if not tenant_slug:
+            return Response({"error": "tenant parameter required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            tenant = Tenant.objects.get(slug=tenant_slug)
+        except Tenant.DoesNotExist:
+            return Response({"error": "Company not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Get career page config
+        try:
+            settings_obj = TenantSettings.objects.get(tenant=tenant)
+            career_config = settings_obj.career_page_config or {}
+        except TenantSettings.DoesNotExist:
+            career_config = {}
+
+        # Get open public jobs
+        jobs = Job.objects.filter(
+            tenant=tenant, status="open", internal_only=False,
+        ).values(
+            "id", "title", "department", "location", "is_remote",
+            "employment_type", "salary_min", "salary_max", "salary_currency",
+            "published_at", "application_deadline",
+        ).order_by("-published_at")[:50]
+
+        return Response({
+            "company": {
+                "name": tenant.company_name,
+                "slug": tenant.slug,
+                "config": career_config,
+            },
+            "jobs": list(jobs),
+        })
+
+
+
+# ===========================================================================
+# NOTIFICATION API (Features 97-112)
+# ===========================================================================
+
+class NotificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        from apps.accounts.models import Notification
+        model = Notification
+        fields = ["id", "type", "title", "body",
+                  "entity_type", "entity_id", "is_read", "created_at"]
+        read_only_fields = ["id", "created_at"]
+
+
+class NotificationPreferenceSerializer(serializers.ModelSerializer):
+    class Meta:
+        from apps.accounts.models import UserNotificationPreference
+        model = UserNotificationPreference
+        fields = ["id", "event_type", "email_enabled", "in_app_enabled"]
+        read_only_fields = ["id"]
+
+
+class NotificationListView(APIView):
+    """Notification center: list, mark read, unread count."""
+    permission_classes = [IsAuthenticated, HasTenantAccess]
+
+    def get(self, request):
+        from apps.accounts.models import Notification
+
+        qs = Notification.objects.filter(
+            user=request.user, tenant_id=request.tenant_id
+        ).order_by("-created_at")
+
+        unread_only = request.query_params.get("unread")
+        if unread_only == "true":
+            qs = qs.filter(is_read=False)
+
+        notifications = qs[:50]
+        unread_count = Notification.objects.filter(
+            user=request.user, tenant_id=request.tenant_id, is_read=False
+        ).count()
+
+        return Response({
+            "unread_count": unread_count,
+            "notifications": NotificationSerializer(notifications, many=True).data,
+        })
+
+    def post(self, request):
+        """Mark notifications as read."""
+        from apps.accounts.models import Notification
+
+        notification_ids = request.data.get("notification_ids", [])
+        mark_all = request.data.get("mark_all", False)
+
+        if mark_all:
+            count = Notification.objects.filter(
+                user=request.user, tenant_id=request.tenant_id, is_read=False
+            ).update(is_read=True)
+        elif notification_ids:
+            count = Notification.objects.filter(
+                id__in=notification_ids, user=request.user, tenant_id=request.tenant_id
+            ).update(is_read=True)
+        else:
+            count = 0
+
+        return Response({"marked_read": count})
+
+
+class NotificationPreferencesView(APIView):
+    """Manage notification preferences per user."""
+    permission_classes = [IsAuthenticated, HasTenantAccess]
+
+    def get(self, request):
+        from apps.accounts.models import UserNotificationPreference
+
+        prefs = UserNotificationPreference.objects.filter(
+            user=request.user, tenant_id=request.tenant_id
+        )
+        return Response(NotificationPreferenceSerializer(prefs, many=True).data)
+
+    def post(self, request):
+        """Bulk update notification preferences."""
+        from apps.accounts.models import UserNotificationPreference
+
+        preferences = request.data.get("preferences", [])
+        updated = 0
+        for pref in preferences:
+            obj, created = UserNotificationPreference.objects.update_or_create(
+                user=request.user,
+                event_type=pref.get("event_type", ""),
+                defaults={
+                    "email_enabled": pref.get("email_enabled", True),
+                    "in_app_enabled": pref.get("in_app_enabled", True),
+                },
+            )
+            updated += 1
+
+        return Response({"updated": updated})
+
+
+class UnifiedNotificationView(APIView):
+    """
+    GET /api/v1/notifications/unified/
+
+    Returns merged notifications from both ATS (local) and HRM (remote).
+    Each notification carries a 'source' field: 'ats' | 'hrm'.
+
+    The HRM fetch is best-effort: if it fails (network issue, HRM down),
+    only ATS notifications are returned.
+
+    Query params:
+      - unread_only: boolean (default false)
+      - limit: integer (default 50, max 200)
+    """
+    permission_classes = [IsAuthenticated, HasTenantAccess]
+
+    def get(self, request):
+        import urllib.request, urllib.error, json as _json
+
+        unread_only = request.query_params.get('unread_only', '').lower() in ('1', 'true', 'yes')
+        limit = min(int(request.query_params.get('limit', 50)), 200)
+
+        # ── ATS notifications ─────────────────────────────────────────────
+        from apps.accounts.models import Notification
+
+        ats_qs = Notification.objects.filter(
+            user=request.user,
+            tenant_id=request.tenant_id,
+        ).order_by('-created_at')
+        if unread_only:
+            ats_qs = ats_qs.filter(is_read=False)
+
+        ats_notifications = [
+            {
+                'id': str(n.id),
+                'source': 'ats',
+                'type': n.notification_type,
+                'title': n.title,
+                'body': n.body,
+                'is_read': n.is_read,
+                'created_at': n.created_at.isoformat(),
+                'metadata': n.metadata or {},
+                'link': n.link or '',
+            }
+            for n in ats_qs[:limit]
+        ]
+
+        # ── HRM notifications (best-effort remote fetch) ──────────────────
+        hrm_notifications = []
+        hrm_url = getattr(settings, 'HRM_BASE_URL', '')
+        if hrm_url:
+            try:
+                # Forward the Authorization header so HRM validates the same JWT
+                auth_header = request.META.get('HTTP_AUTHORIZATION', '')
+                params = f'?limit={limit}'
+                if unread_only:
+                    params += '&unread_only=true'
+
+                req = urllib.request.Request(
+                    hrm_url.rstrip('/') + '/api/v1/platform/notifications/' + params,
+                    headers={
+                        'Authorization': auth_header,
+                        'X-Tenant-ID': str(request.tenant_id),
+                        'Accept': 'application/json',
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    hrm_data = _json.loads(resp.read())
+                    for n in hrm_data.get('results', hrm_data if isinstance(hrm_data, list) else []):
+                        hrm_notifications.append({
+                            'id': str(n.get('id', '')),
+                            'source': 'hrm',
+                            'type': n.get('notification_type', n.get('type', 'info')),
+                            'title': n.get('title', ''),
+                            'body': n.get('body', n.get('message', '')),
+                            'is_read': n.get('is_read', False),
+                            'created_at': n.get('created_at', ''),
+                            'metadata': n.get('metadata', {}),
+                            'link': n.get('link', ''),
+                        })
+            except (urllib.error.URLError, Exception):
+                # HRM unreachable — return ATS-only silently
+                pass
+
+        # ── Merge and sort by created_at desc ─────────────────────────────
+        merged = ats_notifications + hrm_notifications
+        try:
+            merged.sort(key=lambda x: x.get('created_at') or '', reverse=True)
+        except Exception:
+            pass
+
+        merged = merged[:limit]
+
+        ats_unread = sum(1 for n in ats_notifications if not n['is_read'])
+        hrm_unread = sum(1 for n in hrm_notifications if not n['is_read'])
+
+        return Response({
+            'notifications': merged,
+            'total_unread': ats_unread + hrm_unread,
+            'ats_unread': ats_unread,
+            'hrm_unread': hrm_unread,
+            'hrm_available': bool(hrm_url),
+        })
+
+
+# ===========================================================================
+# ADVANCED ANALYTICS ENDPOINTS (Features 93, 164, 170, 151, 103, 46, 44, 16)
+# ===========================================================================
+
+class TrendReportView(APIView):
+    """Month-over-month trend comparison."""
+    permission_classes = [IsAuthenticated, HasTenantAccess]
+
+    def get(self, request):
+        from apps.analytics.utils import generate_trend_report
+        months = int(request.query_params.get("months", 6))
+        return Response(generate_trend_report(request.tenant_id, months))
+
+
+class RejectionAnalyticsView(APIView):
+    """Rejection reasons by stage, job, department."""
+    permission_classes = [IsAuthenticated, HasTenantAccess]
+
+    def get(self, request):
+        from apps.analytics.utils import rejection_analytics
+        job_id = request.query_params.get("job_id")
+        return Response(rejection_analytics(request.tenant_id, job_id))
+
+
+class InterviewToHireRatioView(APIView):
+    """How many interviews per hire."""
+    permission_classes = [IsAuthenticated, HasTenantAccess]
+
+    def get(self, request):
+        from apps.analytics.utils import interview_to_hire_ratio
+        job_id = request.query_params.get("job_id")
+        return Response(interview_to_hire_ratio(request.tenant_id, job_id))
+
+
+class OfferComparisonView(APIView):
+    """Compare current vs historical offers for a job."""
+    permission_classes = [IsAuthenticated, HasTenantAccess]
+
+    def get(self, request):
+        from apps.analytics.utils import offer_comparison
+        job_id = request.query_params.get("job_id")
+        if not job_id:
+            return Response({"error": "job_id required"}, status=400)
+        return Response(offer_comparison(request.tenant_id, job_id))
+
+
+class VotingTallyView(APIView):
+    """Hiring committee voting tally for an application."""
+    permission_classes = [IsAuthenticated, HasTenantAccess]
+
+    def get(self, request, pk):
+        from apps.analytics.utils import voting_tally
+        return Response(voting_tally(request.tenant_id, str(pk)))
+
+
+class ScoreComparisonView(APIView):
+    """Compare a candidate's scores across all their jobs."""
+    permission_classes = [IsAuthenticated, HasTenantAccess]
+
+    def get(self, request, pk):
+        from apps.analytics.utils import score_comparison_across_jobs
+        return Response(score_comparison_across_jobs(request.tenant_id, str(pk)))
+
+
+class BatchRescoreView(APIView):
+    """Re-score all candidates for a job against updated requirements."""
+    permission_classes = [IsAuthenticated, HasTenantAccess, IsRecruiter]
+
+    def post(self, request):
+        from apps.analytics.utils import batch_rescore
+        job_id = request.data.get("job_id")
+        if not job_id:
+            return Response({"error": "job_id required"}, status=400)
+        return Response(batch_rescore(request.tenant_id, job_id))
+
+
+class CostPerHireView(APIView):
+    """Estimated cost-per-hire metrics."""
+    permission_classes = [IsAuthenticated, HasTenantAccess]
+
+    def get(self, request):
+        from apps.candidates.utils import calculate_cost_per_hire
+        job_id = request.query_params.get("job_id")
+        return Response(calculate_cost_per_hire(request.tenant_id, job_id))
+
+
+# ===========================================================================
+# DATA QUALITY & COMPLIANCE ENDPOINTS (Features 128, 130, 132, 134, 179)
+# ===========================================================================
+
+class DataCleanupView(APIView):
+    """Bulk data quality report for tenant."""
+    permission_classes = [IsAuthenticated, HasTenantAccess, IsRecruiter]
+
+    def get(self, request):
+        from apps.candidates.utils import bulk_data_cleanup
+        return Response(bulk_data_cleanup(request.tenant_id))
+
+
+class ContactValidationView(APIView):
+    """Validate contact info for a candidate."""
+    permission_classes = [IsAuthenticated, HasTenantAccess]
+
+    def get(self, request, pk):
+        from apps.candidates.utils import validate_candidate_contacts
+        return Response(validate_candidate_contacts(request.tenant_id, str(pk)))
+
+
+class StaleDataFlaggingView(APIView):
+    """Flag candidates with outdated data."""
+    permission_classes = [IsAuthenticated, HasTenantAccess, IsRecruiter]
+
+    def post(self, request):
+        from apps.candidates.utils import flag_stale_candidates
+        stale_days = int(request.data.get("stale_days", 365))
+        flagged = flag_stale_candidates(request.tenant_id, stale_days)
+        return Response({"flagged": flagged})
+
+
+class GDPRPurgeView(APIView):
+    """Right to deletion — GDPR data purge."""
+    permission_classes = [IsAuthenticated, HasTenantAccess, IsRecruiter]
+
+    def post(self, request, pk):
+        from apps.candidates.utils import purge_candidate_data
+        result = purge_candidate_data(
+            request.tenant_id, str(pk), str(request.user.id)
+        )
+        return Response(result)
+
+
+class EarlyAttritionView(APIView):
+    """Employees who left within 90 days."""
+    permission_classes = [IsAuthenticated, HasTenantAccess]
+
+    def get(self, request):
+        from apps.candidates.utils import check_early_attrition
+        return Response({"alerts": check_early_attrition(request.tenant_id)})
+
+
+class BuddySuggestionView(APIView):
+    """Auto-suggest buddy/mentor for new hire."""
+    permission_classes = [IsAuthenticated, HasTenantAccess]
+
+    def get(self, request, pk):
+        from apps.candidates.utils import suggest_buddy
+        return Response({"suggestions": suggest_buddy(request.tenant_id, str(pk))})
+
+
+# ===========================================================================
+# INTERVIEW CONFLICT DETECTION (Feature 60)
+# ===========================================================================
+
+class InterviewConflictView(APIView):
+    """Check if interviewer has scheduling conflicts."""
+    permission_classes = [IsAuthenticated, HasTenantAccess]
+
+    def get(self, request):
+        from apps.candidates.utils import check_interview_conflicts
+        from datetime import date as d, time as t
+
+        interviewer_id = request.query_params.get("interviewer_id")
+        date_str = request.query_params.get("date")
+        time_str = request.query_params.get("time")
+
+        if not interviewer_id or not date_str:
+            return Response({"error": "interviewer_id and date required"}, status=400)
+
+        try:
+            date = d.fromisoformat(date_str)
+        except ValueError:
+            return Response({"error": "Invalid date format"}, status=400)
+
+        start_time = None
+        if time_str:
+            try:
+                start_time = t.fromisoformat(time_str)
+            except ValueError:
+                pass
+
+        conflicts = check_interview_conflicts(
+            request.tenant_id, interviewer_id, date, start_time
+        )
+        return Response({"conflicts": conflicts, "has_conflict": len(conflicts) > 0})
+
+
+# ===========================================================================
+# PORTAL SELF-SERVICE ENDPOINTS (Features 114-117, 121)
+# ===========================================================================
+
+class PortalDocumentUploadView(APIView):
+    """Candidate uploads additional documents via secure link."""
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        import jwt
+        from django.conf import settings
+
+        token = request.data.get("token")
+        if not token:
+            return Response({"error": "Token required"}, status=400)
+
+        try:
+            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+            if payload.get("purpose") != "document_upload":
+                raise jwt.InvalidTokenError("Wrong purpose")
+        except jwt.InvalidTokenError:
+            return Response({"error": "Invalid token"}, status=401)
+
+        # Save uploaded file
+        file = request.FILES.get("file")
+        if not file:
+            return Response({"error": "No file provided"}, status=400)
+
+        from apps.candidates.models import ResumeDocument, Candidate
+
+        try:
+            candidate = Candidate.objects.get(
+                id=payload["candidate_id"], tenant_id=payload["tenant_id"]
+            )
+        except Candidate.DoesNotExist:
+            return Response({"error": "Candidate not found"}, status=404)
+
+        # Save file
+        from django.core.files.storage import default_storage
+        path = default_storage.save(
+            f"candidates/{candidate.id}/documents/{file.name}", file
+        )
+
+        # Create as new resume version
+        latest = ResumeDocument.objects.filter(candidate=candidate).order_by("-version").first()
+        version = (latest.version + 1) if latest else 1
+
+        doc = ResumeDocument.objects.create(
+            tenant_id=payload["tenant_id"],
+            candidate=candidate,
+            version=version,
+            file_url=path,
+            file_type=file.content_type or "application/octet-stream",
+        )
+
+        return Response({
+            "document_id": str(doc.id),
+            "version": version,
+            "file_url": path,
+            "status": "uploaded",
+        }, status=201)
+
+
+class PortalProfileUpdateView(APIView):
+    """Candidate updates their contact info/skills through portal."""
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        import jwt
+        from django.conf import settings
+
+        token = request.data.get("token")
+        if not token:
+            return Response({"error": "Token required"}, status=400)
+
+        try:
+            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+            if payload.get("purpose") != "profile_update":
+                raise jwt.InvalidTokenError("Wrong purpose")
+        except jwt.InvalidTokenError:
+            return Response({"error": "Invalid token"}, status=401)
+
+        from apps.candidates.models import Candidate
+
+        try:
+            candidate = Candidate.objects.get(
+                id=payload["candidate_id"], tenant_id=payload["tenant_id"]
+            )
+        except Candidate.DoesNotExist:
+            return Response({"error": "Not found"}, status=404)
+
+        # Update allowed fields
+        allowed = ["primary_phone", "location", "headline", "linkedin_url",
+                    "github_url", "portfolio_url", "availability", "preferred_contact"]
+        updated_fields = []
+        for field in allowed:
+            if field in request.data:
+                setattr(candidate, field, request.data[field])
+                updated_fields.append(field)
+
+        if updated_fields:
+            updated_fields.append("updated_at")
+            candidate.save(update_fields=updated_fields)
+
+        return Response({"updated_fields": updated_fields, "status": "updated"})
+
+
+class PortalSelfScheduleView(APIView):
+    """Candidate self-schedules interview from available time slots."""
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        """Get available time slots."""
+        import jwt
+        from django.conf import settings
+
+        token = request.query_params.get("token")
+        if not token:
+            return Response({"error": "Token required"}, status=400)
+
+        try:
+            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+            if payload.get("purpose") != "self_schedule":
+                raise jwt.InvalidTokenError("Wrong purpose")
+        except jwt.InvalidTokenError:
+            return Response({"error": "Invalid token"}, status=401)
+
+        from apps.applications.models import Interview
+
+        # Return pending interviews that need scheduling
+        interviews = Interview.objects.filter(
+            application_id=payload.get("application_id"),
+            tenant_id=payload["tenant_id"],
+            status="pending",
+        ).values("id", "interview_type", "round_name", "round_number")
+
+        return Response({"interviews": list(interviews)})
+
+    def post(self, request):
+        """Candidate selects a time slot."""
+        import jwt
+        from django.conf import settings
+        from datetime import date, time
+
+        token = request.data.get("token")
+        if not token:
+            return Response({"error": "Token required"}, status=400)
+
+        try:
+            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+            if payload.get("purpose") != "self_schedule":
+                raise jwt.InvalidTokenError("Wrong purpose")
+        except jwt.InvalidTokenError:
+            return Response({"error": "Invalid token"}, status=401)
+
+        from apps.applications.models import Interview
+
+        interview_id = request.data.get("interview_id")
+        selected_date = request.data.get("date")
+        selected_time = request.data.get("time")
+
+        if not all([interview_id, selected_date, selected_time]):
+            return Response({"error": "interview_id, date, and time required"}, status=400)
+
+        try:
+            interview = Interview.objects.get(
+                id=interview_id,
+                tenant_id=payload["tenant_id"],
+                status="pending",
+            )
+            interview.date = date.fromisoformat(selected_date)
+            interview.time = time.fromisoformat(selected_time)
+            interview.status = "scheduled"
+            interview.save(update_fields=["date", "time", "status", "updated_at"])
+
+            return Response({
+                "interview_id": str(interview.id),
+                "date": str(interview.date),
+                "time": str(interview.time),
+                "status": "scheduled",
+            })
+        except Interview.DoesNotExist:
+            return Response({"error": "Interview not found"}, status=404)
+
+
+class PortalOfferReviewView(APIView):
+    """Candidate reviews and accepts/declines offer."""
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        """View offer details."""
+        import jwt
+        from django.conf import settings
+
+        token = request.query_params.get("token")
+        if not token:
+            return Response({"error": "Token required"}, status=400)
+
+        try:
+            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+            if payload.get("purpose") != "offer_review":
+                raise jwt.InvalidTokenError("Wrong purpose")
+        except jwt.InvalidTokenError:
+            return Response({"error": "Invalid token"}, status=401)
+
+        from apps.applications.models import Offer
+
+        try:
+            offer = Offer.objects.select_related("application__job").get(
+                application_id=payload.get("application_id"),
+                tenant_id=payload["tenant_id"],
+                status="pending",
+            )
+        except Offer.DoesNotExist:
+            return Response({"error": "Offer not found"}, status=404)
+
+        return Response({
+            "offer_id": str(offer.id),
+            "job_title": offer.application.job.title if offer.application and offer.application.job else "",
+            "salary": str(offer.salary_offered) if offer.salary_offered else None,
+            "currency": offer.salary_currency,
+            "valid_until": offer.valid_until.isoformat() if offer.valid_until else None,
+            "status": offer.status,
+        })
+
+    def post(self, request):
+        """Accept or decline offer."""
+        import jwt
+        from django.conf import settings
+
+        token = request.data.get("token")
+        decision = request.data.get("decision")  # "accept" or "decline"
+
+        if not token or decision not in ("accept", "decline"):
+            return Response({"error": "Token and decision (accept/decline) required"}, status=400)
+
+        try:
+            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+            if payload.get("purpose") != "offer_review":
+                raise jwt.InvalidTokenError("Wrong purpose")
+        except jwt.InvalidTokenError:
+            return Response({"error": "Invalid token"}, status=401)
+
+        from apps.applications.models import Offer
+
+        try:
+            offer = Offer.objects.get(
+                application_id=payload.get("application_id"),
+                tenant_id=payload["tenant_id"],
+                status="pending",
+            )
+        except Offer.DoesNotExist:
+            return Response({"error": "Offer not found"}, status=404)
+
+        if decision == "accept":
+            offer.status = "accepted"
+            offer.accepted_at = timezone.now()
+        else:
+            offer.status = "declined"
+            offer.decline_reason = request.data.get("reason", "")
+
+        offer.save()
+        return Response({"offer_id": str(offer.id), "status": offer.status})
+
+
+class PortalReferralView(APIView):
+    """Employee refers a candidate through a form."""
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        import jwt
+        from django.conf import settings
+
+        token = request.data.get("token")
+        if not token:
+            return Response({"error": "Token required"}, status=400)
+
+        try:
+            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+            if payload.get("purpose") != "referral":
+                raise jwt.InvalidTokenError("Wrong purpose")
+        except jwt.InvalidTokenError:
+            return Response({"error": "Invalid token"}, status=401)
+
+        from apps.candidates.models import Candidate
+        from apps.candidates.services import resolve_candidate
+
+        full_name = request.data.get("full_name", "")
+        email = request.data.get("email", "")
+        phone = request.data.get("phone", "")
+        job_id = request.data.get("job_id")
+        referrer_note = request.data.get("note", "")
+
+        if not full_name or not email:
+            return Response({"error": "full_name and email required"}, status=400)
+
+        # Resolve or create candidate — resolve_candidate returns a dict, not a model instance
+        result = resolve_candidate(
+            tenant_id=payload["tenant_id"],
+            full_name=full_name,
+            email=email,
+            phone=phone,
+        )
+
+        tenant_id = payload["tenant_id"]
+        if result["candidate_id"] is not None:
+            try:
+                candidate = Candidate.objects.get(id=result["candidate_id"], tenant_id=tenant_id)
+            except Candidate.DoesNotExist:
+                candidate = None
+        else:
+            candidate = None
+
+        if candidate is None:
+            candidate = Candidate.objects.create(
+                tenant_id=tenant_id,
+                full_name=full_name,
+                primary_email=email,
+                primary_phone=phone,
+                source="referral",
+            )
+
+        # Add referrer info as tag
+        referrer_id = payload.get("referrer_id", "")
+        candidate.tags = list(set((candidate.tags or []) + [f"referral:{referrer_id}"]))
+        candidate.save(update_fields=["tags", "updated_at"])
+
+        return Response({
+            "candidate_id": str(candidate.id),
+            "status": "referred",
+            "referrer_id": referrer_id,
+        }, status=201)
+
+
+# ===========================================================================
+# LOGIN AUDIT TRAIL (Feature 136)
+# ===========================================================================
+
+class LoginAuditView(APIView):
+    """View login audit trail for the tenant."""
+    permission_classes = [IsAuthenticated, HasTenantAccess]
+
+    def get(self, request):
+        from apps.tenants.models import ActivityLog
+
+        logs = ActivityLog.objects.filter(
+            tenant_id=request.tenant_id,
+            action__in=["login", "logout", "login_failed"],
+        ).order_by("-created_at")[:100]
+
+        return Response([
+            {
+                "user_id": str(log.actor_id) if log.actor_id else None,
+                "action": log.action,
+                "ip_address": log.metadata.get("ip_address", "") if log.metadata else "",
+                "user_agent": log.metadata.get("user_agent", "") if log.metadata else "",
+                "timestamp": log.created_at.isoformat(),
+            }
+            for log in logs
+        ])
+
+
+# ===========================================================================
+# API RATE LIMITING CONFIG (Feature 138)
+# ===========================================================================
+
+class RateLimitConfigView(APIView):
+    """View and configure API rate limits."""
+    permission_classes = [IsAuthenticated, HasTenantAccess]
+
+    def get(self, request):
+        from django.conf import settings
+        throttle_config = getattr(settings, "REST_FRAMEWORK", {}).get("DEFAULT_THROTTLE_RATES", {})
+        return Response({
+            "throttle_rates": throttle_config,
+            "rate_limit_enabled": bool(throttle_config),
+        })
+
+
+# ===========================================================================
+# JOB SHARING LINK (Feature 37)
+# ===========================================================================
+
+class JobShareLinkView(APIView):
+    """Generate shareable public link for a job."""
+    permission_classes = [IsAuthenticated, HasTenantAccess]
+
+    def get(self, request, pk):
+        from apps.jobs.models import Job
+
+        try:
+            job = Job.objects.get(id=pk, tenant_id=request.tenant_id)
+        except Job.DoesNotExist:
+            return Response({"error": "Job not found"}, status=404)
+
+        # Increment view counter
+        job.view_count = (job.view_count or 0) + 1
+        job.save(update_fields=["view_count"])
+
+        share_url = f"/portal/career-page/?tenant={job.tenant.slug}#job-{job.id}"
+        return Response({
+            "job_id": str(job.id),
+            "title": job.title,
+            "share_url": share_url,
+            "view_count": job.view_count,
+        })
+
+
+# ===========================================================================
+# EXTENDED URL PATTERNS
+# ===========================================================================
+
+analytics_urlpatterns = [
+    path("", AnalyticsView.as_view(), name="analytics"),
+    path("funnel/", FunnelView.as_view(), name="analytics-funnel"),
+    path("kpis/", KPIDashboardView.as_view(), name="analytics-kpis"),
+    path("recruiter-performance/", RecruiterPerformanceView.as_view(), name="analytics-recruiter-perf"),
+    path("pipeline-velocity/", PipelineVelocityView.as_view(), name="analytics-pipeline-velocity"),
+    path("diversity/", DiversityMetricsView.as_view(), name="analytics-diversity"),
+    path("source-roi/", SourceROIView.as_view(), name="analytics-source-roi"),
+    path("sla-compliance/", SLAComplianceView.as_view(), name="analytics-sla"),
+    path("export/", AnalyticsExportView.as_view(), name="analytics-export"),
+    path("hiring-forecast/", HiringForecastView.as_view(), name="analytics-forecast"),
+    path("saved-reports/", SavedReportListView.as_view(), name="analytics-saved-reports"),
+    path("saved-reports/<uuid:pk>/", SavedReportDetailView.as_view(), name="analytics-saved-report-detail"),
+    # NEW — Waves 6-8 completion
+    path("trends/", TrendReportView.as_view(), name="analytics-trends"),
+    path("rejections/", RejectionAnalyticsView.as_view(), name="analytics-rejections"),
+    path("interview-to-hire/", InterviewToHireRatioView.as_view(), name="analytics-interview-hire"),
+    path("offer-comparison/", OfferComparisonView.as_view(), name="analytics-offer-comparison"),
+    path("cost-per-hire/", CostPerHireView.as_view(), name="analytics-cost-per-hire"),
+    path("voting/<uuid:pk>/", VotingTallyView.as_view(), name="analytics-voting"),
+    path("score-comparison/<uuid:pk>/", ScoreComparisonView.as_view(), name="analytics-score-comparison"),
+    path("batch-rescore/", BatchRescoreView.as_view(), name="analytics-batch-rescore"),
+    path("early-attrition/", EarlyAttritionView.as_view(), name="analytics-early-attrition"),
+    path("data-cleanup/", DataCleanupView.as_view(), name="analytics-data-cleanup"),
+    path("stale-data/", StaleDataFlaggingView.as_view(), name="analytics-stale-data"),
+    path("interview-conflicts/", InterviewConflictView.as_view(), name="analytics-interview-conflicts"),
+]
+
+portal_urlpatterns = [
+    path("apply/", PortalApplyView.as_view(), name="portal-apply"),
+    path("status/", PortalStatusView.as_view(), name="portal-status"),
+    path("job-alerts/", PortalJobAlertView.as_view(), name="portal-job-alerts"),
+    path("feedback/", PortalFeedbackView.as_view(), name="portal-feedback"),
+    path("career-page/", PortalCareerPageView.as_view(), name="portal-career-page"),
+    # NEW — Portal self-service
+    path("upload/", PortalDocumentUploadView.as_view(), name="portal-upload"),
+    path("profile/", PortalProfileUpdateView.as_view(), name="portal-profile"),
+    path("self-schedule/", PortalSelfScheduleView.as_view(), name="portal-self-schedule"),
+    path("offer-review/", PortalOfferReviewView.as_view(), name="portal-offer-review"),
+    path("referral/", PortalReferralView.as_view(), name="portal-referral"),
+]
+
+notification_urlpatterns = [
+    path("", NotificationListView.as_view(), name="notifications"),
+    path("preferences/", NotificationPreferencesView.as_view(), name="notification-preferences"),
+    path("unified/", UnifiedNotificationView.as_view(), name="notifications-unified"),
+]
+
+# Additional URL patterns for compliance/admin
+compliance_urlpatterns = [
+    path("validate-contact/<uuid:pk>/", ContactValidationView.as_view(), name="validate-contact"),
+    path("gdpr-purge/<uuid:pk>/", GDPRPurgeView.as_view(), name="gdpr-purge"),
+    path("login-audit/", LoginAuditView.as_view(), name="login-audit"),
+    path("rate-limits/", RateLimitConfigView.as_view(), name="rate-limits"),
+    path("buddy-suggestion/<uuid:pk>/", BuddySuggestionView.as_view(), name="buddy-suggestion"),
+    path("job-share/<uuid:pk>/", JobShareLinkView.as_view(), name="job-share"),
+]
+

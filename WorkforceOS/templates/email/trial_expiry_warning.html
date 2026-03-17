@@ -1,0 +1,13 @@
+{% extends "email/base_email.html" %}
+{% block subject %}Your ConnectOS trial expires in {{ days_remaining }} days{% endblock %}
+{% block content %}
+<h2>Your trial is ending soon</h2>
+<p>Hi {{ user_name }},</p>
+<div class="alert alert-warning">
+  <strong>&#9888; Your free trial expires in {{ days_remaining }} day{{ days_remaining|pluralize }}.</strong>
+</div>
+<p>To avoid any disruption to your team's workflow, please upgrade your plan before <strong>{{ trial_ends_at }}</strong>.</p>
+<p>After your trial ends, your account will enter a 3-day read-only grace period, after which access will be restricted.</p>
+<a href="{{ upgrade_url }}" class="btn btn-warning">Upgrade Now</a>
+<p style="margin-top: 16px; color: #6b7280; font-size: 13px;">Questions about pricing? <a href="mailto:support@connectos.io" style="color: #4f46e5;">Contact us</a></p>
+{% endblock %}

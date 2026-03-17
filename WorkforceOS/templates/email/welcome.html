@@ -1,0 +1,18 @@
+{% extends "email/base_email.html" %}
+{% block subject %}Welcome to ConnectOS!{% endblock %}
+{% block content %}
+<h2>Welcome to ConnectOS, {{ company_name }}! 🎉</h2>
+<p>Hi {{ user_name }},</p>
+<p>Thank you for joining ConnectOS. Your 14-day free trial has started — no credit card required.</p>
+<p>Here's what you can do right now:</p>
+<ul>
+  <li>Configure your company profile</li>
+  <li>Invite your team members</li>
+  <li>Set up your recruitment pipelines (ATS) or HR workflows (HRM)</li>
+</ul>
+<div class="alert alert-warning">
+  <strong>Your trial expires on {{ trial_ends_at }}.</strong> Upgrade anytime to keep uninterrupted access.
+</div>
+<a href="{{ app_url }}/dashboard" class="btn">Get Started →</a>
+<p style="margin-top: 24px; color: #6b7280; font-size: 13px;">Need help? Reply to this email or visit our <a href="{{ app_url }}/docs" style="color: #4f46e5;">documentation</a>.</p>
+{% endblock %}

@@ -1,0 +1,12 @@
+{% extends "email/base_email.html" %}
+{% block subject %}Your ConnectOS trial has expired{% endblock %}
+{% block content %}
+<h2>Your trial has expired</h2>
+<p>Hi {{ user_name }},</p>
+<div class="alert alert-danger">
+  <strong>&#128274; Your free trial ended on {{ trial_ends_at }}.</strong>
+</div>
+<p>Your account is currently in read-only mode. To restore full access for your team, please upgrade to a paid plan.</p>
+<a href="{{ upgrade_url }}" class="btn btn-danger">Reactivate Account</a>
+<p style="margin-top: 16px; color: #6b7280; font-size: 13px;">Need an extension? <a href="mailto:support@connectos.io" style="color: #4f46e5;">Reach out to us</a> — we're happy to help.</p>
+{% endblock %}

@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Job Alert</title></head>
+<body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+  <div style="text-align: center; margin-bottom: 30px;">
+    <h1 style="color: #2563eb;">JobFinder.lk</h1>
+  </div>
+  <h2>Job Alert: {{ alert.name }}</h2>
+  <p>Here are new jobs matching your alert:</p>
+  {% for job in jobs %}
+  <div style="background-color: #f8fafc; padding: 15px; border-radius: 8px; margin: 10px 0;">
+    <h3 style="margin: 0 0 5px;">{{ job.title_en }}</h3>
+    <p style="margin: 0; color: #666; font-size: 14px;">{{ job.employer.company_name }} &middot; {{ job.location_text }}</p>
+    {% if job.is_salary_visible and job.salary_min %}
+    <p style="margin: 5px 0 0; color: #2563eb; font-weight: bold; font-size: 14px;">LKR {{ job.salary_min|floatformat:0 }}{% if job.salary_max %} - {{ job.salary_max|floatformat:0 }}{% endif %}</p>
+    {% endif %}
+  </div>
+  {% endfor %}
+  <div style="text-align: center; margin: 20px 0;">
+    <a href="{{ alert.get_search_url }}" style="color: #2563eb; font-weight: bold;">View all matching jobs &rarr;</a>
+  </div>
+  <hr style="border: none; border-top: 1px solid #eee; margin: 30px 0;">
+  <p style="color: #999; font-size: 12px;">You're receiving this because you set up a job alert. <a href="#">Manage alerts</a></p>
+</body>
+</html>
